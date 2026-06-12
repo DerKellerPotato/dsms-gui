@@ -1,0 +1,716 @@
+#!/usr/bin/env python3
+"""DSMS Control Center — GTK desktop app for DSMS.
+
+Edits /etc/dsms/dsms.conf through a form UI, applies the configuration,
+runs the domain join, and imports/exports configuration files. Runs as a
+normal user; privileged operations go through pkexec -> /usr/local/bin/dsms.
+
+Dependencies: python3-gi, gir1.2-gtk-3.0 (preinstalled on Mint/Ubuntu).
+"""
+
+import os
+import re
+import shutil
+import sys
+import tempfile
+
+import gi
+
+gi.require_version("Gtk", "3.0")
+from gi.repository import Gtk, GLib, Gio  # noqa: E402
+
+CONF_PATH = "/etc/dsms/dsms.conf"
+TEMPLATE_PATHS = ["/etc/dsms/dsms.conf.example",
+                  os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "dsms.conf")]
+DSMS_BIN = shutil.which("dsms") or "/usr/local/bin/dsms"
+
+# ---------------------------------------------------------------------------
+# Schema: sections -> fields. Each field: (key, label, widget type, tooltip
+# [, choices]). Types: text, password, multiline, yesno, choice.
+# Tooltips mirror the explanations in the dsms.conf template.
+# ---------------------------------------------------------------------------
+SCHEMA = [
+    ("Domain", [
+        ("DOMAIN_TYPE", "Directory type", "choice",
+         "ad = Active Directory / Synology Directory Server (Kerberos).\n"
+         "ldap = plain LDAP (OpenLDAP, Synology LDAP Server package).\n"
+         "none = no domain, local users only.",
+         [("ad", "Active Directory / Synology Directory Server"),
+          ("ldap", "LDAP (OpenLDAP / Synology LDAP Server)"),
+          ("none", "None — local users only")]),
+        ("AD_DOMAIN", "AD domain name", "text",
+         "DNS name of the domain, lowercase. Example: company.local"),
+        ("AD_REALM", "Kerberos realm", "text",
+         "Usually the domain name in UPPERCASE. Example: COMPANY.LOCAL"),
+        ("AD_SERVER", "Domain controller", "text",
+         "Hostname or IP of a specific DC. Empty = auto-discover via DNS.\n"
+         "For Synology Directory Server: set the NAS hostname."),
+        ("AD_OU", "Computer OU", "text",
+         "OU for the machine account. Empty = default container.\n"
+         "Example: OU=Linux,OU=Computers,DC=company,DC=local"),
+        ("JOIN_USER", "Join account", "text",
+         "Domain account allowed to join machines (e.g. a Domain Admin).\n"
+         "Used by the Join button and unattended setups."),
+        ("LDAP_SERVER", "LDAP server", "text",
+         "Hostname or IP of the LDAP server (LDAP mode only)."),
+        ("LDAP_URI", "LDAP URI", "text",
+         "Full URI; empty = ldap://<server>. Use ldaps:// for TLS on port 636."),
+        ("LDAP_BASE_DN", "Base DN", "text",
+         "Search base of the directory. Example: dc=company,dc=local"),
+        ("LDAP_BIND_DN", "Bind DN", "text",
+         "Read-only service account DN used by SSSD.\n"
+         "Example: uid=ldapbind,cn=users,dc=company,dc=local"),
+        ("LDAP_BIND_PW", "Bind password", "password",
+         "Password of the bind account. Stored in /etc/dsms/dsms.conf (mode 640)."),
+        ("LDAP_TLS", "LDAP TLS", "choice",
+         "yes = verify certificate (production).\n"
+         "allow = TLS but accept self-signed certs.\nno = no TLS.",
+         [("yes", "yes — verify certificate"),
+          ("allow", "allow — accept self-signed"),
+          ("no", "no — unencrypted")]),
+        ("LDAP_DOMAIN", "LDAP domain name", "text",
+         "Domain label used by SSSD. Example: company.local"),
+    ]),
+    ("Home Directory", [
+        ("HOME_MODE", "Home mode", "choice",
+         "smb = mount the SMB share directly at login (needs network).\n"
+         "sync_smb = local home, rsync to/from an SMB share (offline-capable).\n"
+         "sync_ssh = local home, rsync over SSH (offline-capable).\n"
+         "local = plain local home.",
+         [("smb", "SMB direct mount"),
+          ("sync_smb", "rsync from SMB share"),
+          ("sync_ssh", "rsync over SSH"),
+          ("local", "Local only")]),
+        ("HOME_SERVER", "SMB server", "text",
+         "File server for home shares. Empty = use the domain server."),
+        ("HOME_SHARE", "Share name", "text",
+         "User home expected at \\\\SERVER\\SHARE\\<user>. Synology: 'homes'."),
+        ("HOME_SMB_DOMAIN", "SMB domain", "text",
+         "Windows domain for the mount. Empty = derived from the AD domain."),
+        ("HOME_SMB_OPTS", "Mount options", "text",
+         "Extra mount.cifs options. vers=3.0 forces SMB3, seal encrypts traffic."),
+        ("HOME_BASE", "Local home base", "text",
+         "Base path for local homes; the user's home is <base>/<user>."),
+        ("MKHOMEDIR", "Create home at first login", "yesno",
+         "pam_mkhomedir creates the local home directory automatically."),
+        ("DEFAULT_SHELL", "Login shell", "text",
+         "Shell assigned to domain users, e.g. /bin/bash."),
+        ("USE_FQDN", "Fully qualified usernames", "yesno",
+         "no = short names (alice). yes = alice@domain — needed only with\n"
+         "multiple domains."),
+        ("ALLOWED_GROUPS", "Allowed groups", "text",
+         "Comma-separated groups allowed to log in. Empty = all domain users."),
+        ("OFFLINE_CREDENTIALS_DAYS", "Offline login days", "text",
+         "Days cached credentials keep working without the domain. 0 = off."),
+    ]),
+    ("Network & System", [
+        ("SET_HOSTNAME", "Hostname", "text",
+         "Set the machine hostname (short or FQDN). Empty = keep current."),
+        ("DNS_SERVERS", "DNS servers", "text",
+         "Space-separated. First entry must be the domain's DNS (DC / NAS).\n"
+         "Empty = leave system DNS untouched."),
+        ("DNS_SEARCH_DOMAIN", "DNS search domain", "text",
+         "Queries under this domain go to the servers above.\n"
+         "Empty = the configured domain name."),
+        ("MANAGE_DNS", "Manage DNS", "choice",
+         "auto = configure systemd-resolved/NetworkManager when present.\n"
+         "yes = same but fail if neither exists. no = don't touch DNS.",
+         [("auto", "auto"), ("yes", "yes"), ("no", "no")]),
+        ("DISABLE_AVAHI", "Disable Avahi (mDNS)", "choice",
+         "Avahi breaks .local AD domains. auto = disable only for .local domains.",
+         [("auto", "auto — only for .local domains"),
+          ("yes", "yes — always disable"),
+          ("no", "no — keep Avahi")]),
+        ("HOSTS_ENTRIES", "Static hosts entries", "multiline",
+         "One per line: IP  fqdn  [aliases]. For Synology add the NAS with the\n"
+         "EXACT hostname casing shown in DSM (GSSAPI fix)."),
+        ("ENABLE_NTP", "Enable NTP", "yesno",
+         "Kerberos fails when clocks differ > 5 min — keep this on in AD domains."),
+        ("NTP_SERVER", "NTP server", "text",
+         "Empty = distribution default. Closed networks: the DC / NAS."),
+        ("SUDO_GROUPS", "Sudo for domain groups", "text",
+         "Comma-separated domain groups that get full sudo.\n"
+         "Example: domain admins"),
+        ("POLKIT_ADMIN_GROUPS", "Polkit admin groups", "text",
+         "Groups that may authenticate GUI admin dialogs. Default: sudo"),
+        ("POLKIT_FALLBACK_USER", "Polkit fallback user", "text",
+         "Local account accepted as admin even when the domain is down."),
+        ("GRANT_HARDWARE_GROUPS", "Grant hardware groups", "yesno",
+         "Grants audio/video/USB/printer groups to every login via pam_group."),
+        ("HARDWARE_GROUPS", "Hardware groups", "text",
+         "Groups granted at login when the switch above is on."),
+        ("SHOW_MANUAL_LOGIN", "Show manual login", "yesno",
+         "Show a username entry on the login screen so domain users can log in."),
+        ("HIDE_USER_LIST", "Hide user list", "yesno",
+         "Hide local accounts on the greeter (users must type their name)."),
+    ]),
+    ("SSH Sync", [
+        ("DSMS_SERVER", "Sync server", "text",
+         "rsync/SSH server for HOME_MODE=sync_ssh."),
+        ("DSMS_SSH_PORT", "SSH port", "text", "SSH port on the sync server."),
+        ("DSMS_SSH_USER", "SSH user", "text",
+         "Server account that owns the synced home tree."),
+        ("DSMS_REMOTE_PATH", "Remote path", "text",
+         "Homes are stored at <remote path>/<user>/ on the server."),
+        ("DSMS_SSH_KEY", "SSH key", "text",
+         "Private key used for sync (generated at install)."),
+        ("DSMS_ENABLED", "Sync enabled", "yesno",
+         "Master switch for login pull, logout push and the 15-min timer."),
+        ("DSMS_MIN_UID", "Minimum UID", "text",
+         "Users below this UID are ignored (system accounts). Default 1000."),
+        ("DSMS_LOGIN_TIMEOUT", "Login timeout (s)", "text",
+         "Max seconds for the background login pull."),
+        ("DSMS_LOGOUT_TIMEOUT", "Logout timeout (s)", "text",
+         "Max seconds the logout push may block the logout."),
+        ("DSMS_RSYNC_TIMEOUT", "rsync timeout (s)", "text",
+         "Network timeout per rsync process."),
+        ("DSMS_HASH_ENABLED", "Hash-based change detection", "yesno",
+         "Keeps a per-file hash database, mirrored to the NAS with every push.\n"
+         "Syncs transfer only files whose content hash differs; within a file\n"
+         "rsync's delta algorithm sends only the changed blocks."),
+        ("DSMS_HASH_ALGO", "Hash algorithm", "choice",
+         "auto picks xxh128 when installed (~10x faster than sha256).\n"
+         "All machines syncing the same home should use the same algorithm.",
+         [("auto", "auto — xxh128 if available, else sha256"),
+          ("xxh128", "xxh128 (fast)"),
+          ("sha256", "sha256"),
+          ("md5", "md5")]),
+        ("DSMS_HASH_TIMEOUT", "Hash build timeout (s)", "text",
+         "Max seconds for (re)building the hash DB. First run hashes the whole\n"
+         "home — increase for very large homes. On timeout: full rsync fallback."),
+        ("DSMS_RSYNC_INPLACE", "In-place server updates", "yesno",
+         "yes = rsync --inplace: only changed blocks written on the NAS (less\n"
+         "write load, good for large files), but interrupted transfers leave that\n"
+         "file inconsistent until the next sync. no = atomic temp-copy + rename."),
+        ("DSMS_INDEX_ENABLED", "Legacy index check", "yesno",
+         "Fallback when hash detection is off: timer skips the rsync when a\n"
+         "cheap size/mtime index shows no changes."),
+    ]),
+]
+
+ALL_KEYS = [f[0] for _, fields in SCHEMA for f in fields]
+HIDDEN_KEYS = ["JOIN_NOW", "JOIN_PASSWORD", "DSMS_CONFIG_TIMEOUT", "DSMS_INDEX_TIMEOUT"]
+
+
+# ---------------------------------------------------------------------------
+# Config parse / serialize
+# ---------------------------------------------------------------------------
+def parse_config(text):
+    """Parse shell KEY="value" assignments, including multiline values."""
+    values = {}
+    for m in re.finditer(r'^([A-Z_][A-Z0-9_]*)="([^"]*)"', text, re.M | re.S):
+        values[m.group(1)] = m.group(2)
+    return values
+
+
+def serialize_config(values):
+    lines = ["# DSMS Unified Configuration — written by dsms-gui",
+             "# Option reference: docs/configuration.md", ""]
+    for section, fields in SCHEMA:
+        lines.append(f"# --- {section} ---")
+        for f in fields:
+            lines.append(f'{f[0]}="{values.get(f[0], "")}"')
+        lines.append("")
+    for key in HIDDEN_KEYS:
+        if key in values:
+            lines.append(f'{key}="{values[key]}"')
+    return "\n".join(lines) + "\n"
+
+
+def load_initial_config():
+    for path in [CONF_PATH] + TEMPLATE_PATHS:
+        try:
+            with open(path, encoding="utf-8") as fh:
+                return parse_config(fh.read()), path == CONF_PATH
+        except OSError:
+            continue
+    return {}, False
+
+
+# ---------------------------------------------------------------------------
+# Command runner dialog
+# ---------------------------------------------------------------------------
+class CommandDialog(Gtk.Dialog):
+    """Runs a command asynchronously and shows its merged output."""
+
+    def __init__(self, parent, title, argv, stdin_data=None, on_done=None):
+        super().__init__(title=title, transient_for=parent, modal=True)
+        self.set_default_size(700, 420)
+        self.add_button("Close", Gtk.ResponseType.CLOSE)
+        self.set_response_sensitive(Gtk.ResponseType.CLOSE, False)
+        self._on_done = on_done
+
+        self.spinner = Gtk.Spinner()
+        self.spinner.start()
+        self.status = Gtk.Label(label=f"Running: {' '.join(argv)}")
+        head = Gtk.Box(spacing=8, margin=8)
+        head.pack_start(self.spinner, False, False, 0)
+        head.pack_start(self.status, False, False, 0)
+
+        self.buf = Gtk.TextBuffer()
+        view = Gtk.TextView(buffer=self.buf, editable=False, monospace=True)
+        view.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+        scroll = Gtk.ScrolledWindow(margin=8)
+        scroll.set_vexpand(True)
+        scroll.add(view)
+
+        box = self.get_content_area()
+        box.pack_start(head, False, False, 0)
+        box.pack_start(scroll, True, True, 0)
+        self.show_all()
+
+        flags = (Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_MERGE)
+        if stdin_data is not None:
+            flags |= Gio.SubprocessFlags.STDIN_PIPE
+        try:
+            proc = Gio.Subprocess.new(argv, flags)
+            proc.communicate_utf8_async(stdin_data, None, self._finished)
+        except GLib.Error as e:
+            self._set_output(f"Failed to start: {e.message}", ok=False)
+
+    def _finished(self, proc, result):
+        try:
+            _, stdout, _ = proc.communicate_utf8_finish(result)
+            ok = proc.get_successful()
+            self._set_output(stdout or "(no output)", ok)
+        except GLib.Error as e:
+            self._set_output(f"Error: {e.message}", ok=False)
+
+    def _set_output(self, text, ok):
+        self.spinner.stop()
+        self.status.set_markup("<b>✓ Completed</b>" if ok else "<b>✗ Failed</b>")
+        self.buf.set_text(text)
+        self.set_response_sensitive(Gtk.ResponseType.CLOSE, True)
+        if self._on_done:
+            self._on_done(ok)
+
+
+# ---------------------------------------------------------------------------
+# Main window
+# ---------------------------------------------------------------------------
+class MainWindow(Gtk.ApplicationWindow):
+    def __init__(self, app):
+        super().__init__(application=app, title="DSMS Control Center")
+        self.set_default_size(820, 640)
+        self.values, self.from_system = load_initial_config()
+        self.widgets = {}
+
+        header = Gtk.HeaderBar(show_close_button=True, title="DSMS Control Center")
+        header.set_subtitle(CONF_PATH if self.from_system else "no system config yet")
+        self.set_titlebar(header)
+
+        save_btn = Gtk.Button(label="Save")
+        save_btn.get_style_context().add_class("suggested-action")
+        save_btn.set_tooltip_text("Write the settings to /etc/dsms/dsms.conf (asks for admin rights)")
+        save_btn.connect("clicked", self.on_save)
+        header.pack_start(save_btn)
+
+        apply_btn = Gtk.Button(label="Apply to System")
+        apply_btn.set_tooltip_text("Re-apply SSSD/PAM/NSS/network config from the saved file")
+        apply_btn.connect("clicked", self.on_apply)
+        header.pack_start(apply_btn)
+
+        menu_btn = Gtk.MenuButton()
+        menu_btn.set_image(Gtk.Image.new_from_icon_name("open-menu-symbolic", Gtk.IconSize.BUTTON))
+        menu = Gtk.Menu()
+        for label, cb in [("Setup wizard…", self.on_wizard),
+                          ("Join domain…", self.on_join),
+                          (None, None),
+                          ("Import configuration…", self.on_import),
+                          ("Export configuration…", self.on_export)]:
+            item = Gtk.SeparatorMenuItem() if label is None else Gtk.MenuItem(label=label)
+            if cb:
+                item.connect("activate", cb)
+            menu.append(item)
+        menu.show_all()
+        menu_btn.set_popup(menu)
+        header.pack_end(menu_btn)
+
+        self.notebook = Gtk.Notebook()
+        self.notebook.append_page(self.build_status_page(), Gtk.Label(label="Status"))
+        for section, fields in SCHEMA:
+            self.notebook.append_page(self.build_form_page(fields), Gtk.Label(label=section))
+        self.add(self.notebook)
+        self.show_all()
+        self.refresh_status()
+
+        if not self.from_system:
+            GLib.idle_add(self.first_run_hint)
+
+    # --- Form construction -------------------------------------------------
+    def build_form_page(self, fields):
+        grid = Gtk.Grid(column_spacing=12, row_spacing=8, margin=16)
+        for row, field in enumerate(fields):
+            key, label, ftype, tooltip = field[0], field[1], field[2], field[3]
+            lbl = Gtk.Label(label=label, xalign=1)
+            lbl.set_tooltip_text(tooltip)
+            grid.attach(lbl, 0, row, 1, 1)
+
+            value = self.values.get(key, "")
+            if ftype == "choice":
+                widget = Gtk.ComboBoxText()
+                for val, text in field[4]:
+                    widget.append(val, text)
+                if not widget.set_active_id(value):
+                    widget.set_active(0)
+            elif ftype == "yesno":
+                widget = Gtk.ComboBoxText()
+                widget.append("yes", "yes")
+                widget.append("no", "no")
+                widget.set_active_id(value if value in ("yes", "no") else "yes")
+            elif ftype == "multiline":
+                buf = Gtk.TextBuffer()
+                buf.set_text(value.strip("\n"))
+                view = Gtk.TextView(buffer=buf, monospace=True)
+                widget = Gtk.ScrolledWindow()
+                widget.set_size_request(-1, 80)
+                widget.set_shadow_type(Gtk.ShadowType.IN)
+                widget.add(view)
+                widget.dsms_buffer = buf
+            else:
+                widget = Gtk.Entry(text=value, hexpand=True)
+                if ftype == "password":
+                    widget.set_visibility(False)
+            widget.set_tooltip_text(tooltip)
+            widget.set_hexpand(True)
+            grid.attach(widget, 1, row, 1, 1)
+            self.widgets[key] = (ftype, widget)
+
+        scroll = Gtk.ScrolledWindow()
+        scroll.add(grid)
+        return scroll
+
+    def collect_values(self):
+        for key, (ftype, widget) in self.widgets.items():
+            if ftype in ("choice", "yesno"):
+                self.values[key] = widget.get_active_id() or ""
+            elif ftype == "multiline":
+                buf = widget.dsms_buffer
+                text = buf.get_text(buf.get_start_iter(), buf.get_end_iter(), False).strip()
+                self.values[key] = f"\n{text}\n" if text else ""
+            else:
+                self.values[key] = widget.get_text().strip()
+        return self.values
+
+    def set_widget_values(self):
+        for key, (ftype, widget) in self.widgets.items():
+            value = self.values.get(key, "")
+            if ftype in ("choice", "yesno"):
+                widget.set_active_id(value)
+            elif ftype == "multiline":
+                widget.dsms_buffer.set_text(value.strip("\n"))
+            else:
+                widget.set_text(value)
+
+    # --- Status page --------------------------------------------------------
+    def build_status_page(self):
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8, margin=16)
+
+        bar = Gtk.Box(spacing=8)
+        refresh = Gtk.Button(label="Refresh")
+        refresh.connect("clicked", lambda *_: self.refresh_status())
+        bar.pack_start(refresh, False, False, 0)
+
+        self.test_entry = Gtk.Entry(placeholder_text="domain username")
+        test_btn = Gtk.Button(label="Test user lookup")
+        test_btn.set_tooltip_text("Checks whether NSS/SSSD can resolve the user (dsms test)")
+        test_btn.connect("clicked", self.on_test_user)
+        bar.pack_end(test_btn, False, False, 0)
+        bar.pack_end(self.test_entry, False, False, 0)
+        box.pack_start(bar, False, False, 0)
+
+        self.status_buf = Gtk.TextBuffer()
+        view = Gtk.TextView(buffer=self.status_buf, editable=False, monospace=True)
+        scroll = Gtk.ScrolledWindow()
+        scroll.set_vexpand(True)
+        scroll.set_shadow_type(Gtk.ShadowType.IN)
+        scroll.add(view)
+        box.pack_start(scroll, True, True, 0)
+        return box
+
+    def refresh_status(self):
+        try:
+            proc = Gio.Subprocess.new([DSMS_BIN, "status"],
+                                      Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_MERGE)
+            proc.communicate_utf8_async(None, None, self._status_done)
+        except GLib.Error as e:
+            self.status_buf.set_text(f"dsms not found ({e.message}).\n"
+                                     "Install DSMS first: sudo bash install.sh")
+
+    def _status_done(self, proc, result):
+        try:
+            _, out, _ = proc.communicate_utf8_finish(result)
+            self.status_buf.set_text(out or "(no output)")
+        except GLib.Error as e:
+            self.status_buf.set_text(f"Error: {e.message}")
+
+    def on_test_user(self, _btn):
+        user = self.test_entry.get_text().strip()
+        if user:
+            CommandDialog(self, f"User lookup: {user}", [DSMS_BIN, "test", user])
+
+    # --- Actions ------------------------------------------------------------
+    def save_config(self, on_done=None):
+        text = serialize_config(self.collect_values())
+        fd, tmp = tempfile.mkstemp(prefix="dsms-conf-", suffix=".conf")
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        os.chmod(tmp, 0o600)
+
+        def done(ok):
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            if ok:
+                self.from_system = True
+                self.get_titlebar().set_subtitle(CONF_PATH)
+            if on_done:
+                on_done(ok)
+
+        CommandDialog(self, "Save configuration",
+                      ["pkexec", DSMS_BIN, "import", tmp], on_done=done)
+
+    def on_save(self, _btn):
+        self.save_config()
+
+    def on_apply(self, _btn):
+        dlg = CommandDialog(self, "Apply configuration", ["pkexec", DSMS_BIN, "apply"])
+        dlg.connect("response", lambda *_: self.refresh_status())
+
+    def on_join(self, *_args):
+        user, password = self.ask_credentials()
+        if user is None:
+            return
+        dlg = CommandDialog(self, "Domain join",
+                            ["pkexec", DSMS_BIN, "join", user],
+                            stdin_data=password + "\n")
+        dlg.connect("response", lambda *_: self.refresh_status())
+
+    def ask_credentials(self):
+        dialog = Gtk.Dialog(title="Domain join", transient_for=self, modal=True)
+        dialog.add_buttons("Cancel", Gtk.ResponseType.CANCEL, "Join", Gtk.ResponseType.OK)
+        grid = Gtk.Grid(column_spacing=12, row_spacing=8, margin=16)
+        user_entry = Gtk.Entry(text=self.values.get("JOIN_USER", ""), hexpand=True)
+        pass_entry = Gtk.Entry(visibility=False, hexpand=True)
+        pass_entry.set_activates_default(True)
+        grid.attach(Gtk.Label(label="Admin account", xalign=1), 0, 0, 1, 1)
+        grid.attach(user_entry, 1, 0, 1, 1)
+        grid.attach(Gtk.Label(label="Password", xalign=1), 0, 1, 1, 1)
+        grid.attach(pass_entry, 1, 1, 1, 1)
+        dialog.get_content_area().add(grid)
+        dialog.set_default_response(Gtk.ResponseType.OK)
+        dialog.show_all()
+        response = dialog.run()
+        user, password = user_entry.get_text().strip(), pass_entry.get_text()
+        dialog.destroy()
+        if response != Gtk.ResponseType.OK or not user:
+            return None, None
+        return user, password
+
+    def on_export(self, *_args):
+        chooser = Gtk.FileChooserDialog(title="Export configuration", transient_for=self,
+                                        action=Gtk.FileChooserAction.SAVE)
+        chooser.add_buttons("Cancel", Gtk.ResponseType.CANCEL, "Export", Gtk.ResponseType.OK)
+        chooser.set_do_overwrite_confirmation(True)
+        chooser.set_current_name("dsms-export.conf")
+        if chooser.run() == Gtk.ResponseType.OK:
+            path = chooser.get_filename()
+            try:
+                with open(path, "w", encoding="utf-8") as fh:
+                    fh.write(serialize_config(self.collect_values()))
+                os.chmod(path, 0o600)
+                self.info("Export complete",
+                          f"Configuration exported to:\n{path}\n\n"
+                          "The file may contain passwords — keep it private.")
+            except OSError as e:
+                self.info("Export failed", str(e), error=True)
+        chooser.destroy()
+
+    def on_import(self, *_args):
+        chooser = Gtk.FileChooserDialog(title="Import configuration", transient_for=self,
+                                        action=Gtk.FileChooserAction.OPEN)
+        chooser.add_buttons("Cancel", Gtk.ResponseType.CANCEL, "Import", Gtk.ResponseType.OK)
+        if chooser.run() == Gtk.ResponseType.OK:
+            path = chooser.get_filename()
+            try:
+                with open(path, encoding="utf-8") as fh:
+                    imported = parse_config(fh.read())
+                if imported.get("DOMAIN_TYPE") not in ("ad", "ldap", "none"):
+                    raise ValueError("not a valid DSMS config (DOMAIN_TYPE missing)")
+                self.values.update(imported)
+                self.set_widget_values()
+                chooser.destroy()
+                self.info("Import loaded",
+                          "Settings loaded into the form.\n"
+                          "Review them, then press Save to write the system config.")
+                return
+            except (OSError, ValueError) as e:
+                self.info("Import failed", str(e), error=True)
+        chooser.destroy()
+
+    # --- Wizard --------------------------------------------------------------
+    def first_run_hint(self):
+        dialog = Gtk.MessageDialog(transient_for=self, modal=True,
+                                   message_type=Gtk.MessageType.QUESTION,
+                                   buttons=Gtk.ButtonsType.YES_NO,
+                                   text="No DSMS configuration found")
+        dialog.format_secondary_text(
+            "This machine has no /etc/dsms/dsms.conf yet.\n"
+            "Run the initial setup wizard now?")
+        if dialog.run() == Gtk.ResponseType.YES:
+            GLib.idle_add(self.on_wizard)
+        dialog.destroy()
+
+    def on_wizard(self, *_args):
+        Wizard(self)
+
+    def info(self, title, text, error=False):
+        dialog = Gtk.MessageDialog(transient_for=self, modal=True,
+                                   message_type=Gtk.MessageType.ERROR if error else Gtk.MessageType.INFO,
+                                   buttons=Gtk.ButtonsType.OK, text=title)
+        dialog.format_secondary_text(text)
+        dialog.run()
+        dialog.destroy()
+
+
+# ---------------------------------------------------------------------------
+# Setup wizard
+# ---------------------------------------------------------------------------
+class Wizard(Gtk.Assistant):
+    """Initial setup: collects the core settings, saves the config and
+    optionally runs the full installation + domain join."""
+
+    def __init__(self, main):
+        super().__init__(transient_for=main, modal=True)
+        self.main = main
+        self.set_title("DSMS Setup Wizard")
+        self.set_default_size(640, 480)
+        self.entries = {}
+
+        intro = Gtk.Label(
+            label="This wizard sets up DSMS on this machine:\n\n"
+                  "  •  Domain connection (Active Directory / Synology / LDAP)\n"
+                  "  •  Home directory mode (SMB mount, sync, local)\n"
+                  "  •  System integration (SSSD, PAM, login screen)\n\n"
+                  "Settings can be changed later in the main window.\n"
+                  "All options — including the advanced ones not shown here —\n"
+                  "are documented in /etc/dsms/dsms.conf.example.",
+            xalign=0, margin=16)
+        self.add_titled_page(intro, "Welcome", Gtk.AssistantPageType.INTRO)
+
+        self.add_titled_page(self.grid_page([
+            ("DOMAIN_TYPE", "Directory type", "choice",
+             [("ad", "Active Directory / Synology Directory Server"),
+              ("ldap", "LDAP (OpenLDAP / Synology LDAP Server)"),
+              ("none", "None — local users only")]),
+            ("AD_DOMAIN", "Domain name (e.g. company.local)", "text", None),
+            ("AD_SERVER", "Domain controller / NAS (empty = DNS auto)", "text", None),
+            ("LDAP_SERVER", "LDAP server (LDAP mode only)", "text", None),
+            ("LDAP_BASE_DN", "Base DN (LDAP mode only)", "text", None),
+            ("LDAP_BIND_DN", "Bind DN (LDAP mode only)", "text", None),
+            ("LDAP_BIND_PW", "Bind password (LDAP mode only)", "password", None),
+        ]), "Domain", Gtk.AssistantPageType.CONTENT)
+
+        self.add_titled_page(self.grid_page([
+            ("HOME_MODE", "Home directory mode", "choice",
+             [("smb", "SMB direct mount (needs network at login)"),
+              ("sync_smb", "rsync from SMB share (offline-capable)"),
+              ("sync_ssh", "rsync over SSH (offline-capable)"),
+              ("local", "Local only")]),
+            ("HOME_SERVER", "SMB server (empty = domain server)", "text", None),
+            ("HOME_SHARE", "Share name (Synology: homes)", "text", None),
+            ("DNS_SERVERS", "DNS server (usually the DC / NAS IP)", "text", None),
+            ("SUDO_GROUPS", "Sudo groups (e.g. domain admins)", "text", None),
+        ]), "Home & Network", Gtk.AssistantPageType.CONTENT)
+
+        summary_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12, margin=16)
+        summary_box.pack_start(Gtk.Label(
+            label="The wizard will now save the configuration to /etc/dsms/dsms.conf.",
+            xalign=0), False, False, 0)
+        self.install_check = Gtk.CheckButton(
+            label="Install packages and apply the configuration now (recommended)")
+        self.install_check.set_active(True)
+        summary_box.pack_start(self.install_check, False, False, 0)
+        self.join_check = Gtk.CheckButton(
+            label="Join the domain afterwards (asks for admin credentials)")
+        self.join_check.set_active(True)
+        summary_box.pack_start(self.join_check, False, False, 0)
+        self.add_titled_page(summary_box, "Finish", Gtk.AssistantPageType.CONFIRM)
+
+        self.connect("cancel", lambda *_: self.destroy())
+        self.connect("close", lambda *_: self.destroy())
+        self.connect("apply", self.on_apply)
+        self.show_all()
+
+    def add_titled_page(self, widget, title, ptype):
+        self.append_page(widget)
+        self.set_page_title(widget, title)
+        self.set_page_type(widget, ptype)
+        self.set_page_complete(widget, True)
+
+    def grid_page(self, fields):
+        grid = Gtk.Grid(column_spacing=12, row_spacing=8, margin=16)
+        for row, (key, label, ftype, choices) in enumerate(fields):
+            grid.attach(Gtk.Label(label=label, xalign=1), 0, row, 1, 1)
+            value = self.main.values.get(key, "")
+            if ftype == "choice":
+                widget = Gtk.ComboBoxText()
+                for val, text in choices:
+                    widget.append(val, text)
+                if not widget.set_active_id(value):
+                    widget.set_active(0)
+            else:
+                widget = Gtk.Entry(text=value, hexpand=True)
+                if ftype == "password":
+                    widget.set_visibility(False)
+            grid.attach(widget, 1, row, 1, 1)
+            self.entries[key] = (ftype, widget)
+        return grid
+
+    def on_apply(self, *_args):
+        for key, (ftype, widget) in self.entries.items():
+            if ftype == "choice":
+                self.main.values[key] = widget.get_active_id() or ""
+            else:
+                self.main.values[key] = widget.get_text().strip()
+        # Derive dependent values like the CLI wizard does
+        domain = self.main.values.get("AD_DOMAIN", "")
+        if domain:
+            self.main.values["AD_REALM"] = domain.upper()
+        if self.main.values.get("LDAP_SERVER") and not self.main.values.get("LDAP_URI"):
+            self.main.values["LDAP_URI"] = "ldap://" + self.main.values["LDAP_SERVER"]
+        self.main.set_widget_values()
+
+        do_install = self.install_check.get_active()
+        do_join = self.join_check.get_active() and self.main.values.get("DOMAIN_TYPE") == "ad"
+        self.destroy()
+
+        def after_save(ok):
+            if ok and do_install:
+                dlg = CommandDialog(self.main, "Installing & applying configuration",
+                                    ["pkexec", DSMS_BIN, "apply", "--full"],
+                                    on_done=after_install)
+                dlg.connect("response", lambda *_: self.main.refresh_status())
+            elif ok and do_join:
+                self.main.on_join()
+
+        def after_install(ok):
+            if ok and do_join:
+                GLib.idle_add(self.main.on_join)
+
+        self.main.save_config(on_done=after_save)
+
+
+class App(Gtk.Application):
+    def __init__(self):
+        super().__init__(application_id="com.dsms.gui",
+                         flags=Gio.ApplicationFlags.FLAGS_NONE)
+
+    def do_activate(self):
+        win = self.get_active_window() or MainWindow(self)
+        win.present()
+
+
+if __name__ == "__main__":
+    sys.exit(App().run(sys.argv))

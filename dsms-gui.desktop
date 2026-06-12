@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=DSMS Control Center
+GenericName=Domain & Storage Management
+Comment=Configure domain login, home directories and sync
+Exec=dsms-gui
+Icon=preferences-system-network
+Terminal=false
+Categories=Settings;System;
+Keywords=domain;active directory;ldap;sssd;synology;home;sync;
