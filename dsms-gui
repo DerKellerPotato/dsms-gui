@@ -19,10 +19,28 @@ import gi
 gi.require_version("Gtk", "3.0")
 from gi.repository import Gtk, GLib, Gio  # noqa: E402
 
+SELF_DIR = os.path.dirname(os.path.abspath(__file__))
 CONF_PATH = "/etc/dsms/dsms.conf"
-TEMPLATE_PATHS = ["/etc/dsms/dsms.conf.example",
-                  os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "dsms.conf")]
+# Config-field template shipped by the 'dsms' package (this app depends on it).
+TEMPLATE_PATHS = ["/etc/dsms/dsms.conf.example"]
 DSMS_BIN = shutil.which("dsms") or "/usr/local/bin/dsms"
+
+
+def dsms_installed():
+    """True when the dsms CLI is present (the GUI drives it for every action)."""
+    return shutil.which("dsms") is not None or os.path.exists("/usr/local/bin/dsms")
+
+
+# --- "Update from GitHub" debug action -------------------------------------
+# Pulls the latest dsms (CLI) and dsms-gui (this app) from GitHub and reinstalls
+# them. The privileged work is done by update-from-github.sh, shipped next to
+# the app; a repo checkout falls back to its in-tree copy.
+GITHUB_CLI_REPO = "https://github.com/DerKellerPotato/dsms.git"
+GITHUB_GUI_REPO = "https://github.com/DerKellerPotato/dsms-gui.git"
+UPDATE_HELPER = next(
+    (p for p in ("/usr/local/lib/dsms-gui/update-from-github.sh",
+                 os.path.join(SELF_DIR, "update-from-github.sh")) if os.path.isfile(p)),
+    "/usr/local/lib/dsms-gui/update-from-github.sh")
 
 # ---------------------------------------------------------------------------
 # Schema: sections -> fields. Each field: (key, label, widget type, tooltip
@@ -317,7 +335,9 @@ class MainWindow(Gtk.ApplicationWindow):
                           ("Join domain…", self.on_join),
                           (None, None),
                           ("Import configuration…", self.on_import),
-                          ("Export configuration…", self.on_export)]:
+                          ("Export configuration…", self.on_export),
+                          (None, None),
+                          ("Update from GitHub…", self.on_update_github)]:
             item = Gtk.SeparatorMenuItem() if label is None else Gtk.MenuItem(label=label)
             if cb:
                 item.connect("activate", cb)
@@ -434,8 +454,12 @@ class MainWindow(Gtk.ApplicationWindow):
                                       Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_MERGE)
             proc.communicate_utf8_async(None, None, self._status_done)
         except GLib.Error as e:
-            self.status_buf.set_text(f"dsms not found ({e.message}).\n"
-                                     "Install DSMS first: sudo bash install.sh")
+            self.status_buf.set_text(
+                f"dsms command not found ({e.message}).\n\n"
+                "This app drives the 'dsms' command-line tool, which is a\n"
+                "dependency of the dsms-gui package. Install it with:\n"
+                "  sudo apt install dsms-gui   (pulls in dsms)\n\n"
+                "Or fetch the latest build via ☰ → Update from GitHub.")
 
     def _status_done(self, proc, result):
         try:
@@ -548,6 +572,25 @@ class MainWindow(Gtk.ApplicationWindow):
             except (OSError, ValueError) as e:
                 self.info("Import failed", str(e), error=True)
         chooser.destroy()
+
+    # --- Debug: update from GitHub ------------------------------------------
+    def on_update_github(self, *_args):
+        confirm = Gtk.MessageDialog(
+            transient_for=self, modal=True, message_type=Gtk.MessageType.QUESTION,
+            buttons=Gtk.ButtonsType.YES_NO, text="Update DSMS from GitHub?")
+        confirm.format_secondary_text(
+            "Downloads the latest 'dsms' (command-line tool) and 'dsms-gui'\n"
+            "(this app) straight from GitHub and reinstalls them — this asks for\n"
+            "admin rights. Use it to test the newest development version.\n\n"
+            "Restart the app afterwards to load the updated GUI.")
+        resp = confirm.run()
+        confirm.destroy()
+        if resp != Gtk.ResponseType.YES:
+            return
+        dlg = CommandDialog(self, "Update from GitHub",
+                            ["pkexec", "bash", UPDATE_HELPER,
+                             GITHUB_CLI_REPO, GITHUB_GUI_REPO])
+        dlg.connect("response", lambda *_: self.refresh_status())
 
     # --- Wizard --------------------------------------------------------------
     def first_run_hint(self):

@@ -1,0 +1,53 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install test dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq python3
+
+      - name: Make scripts executable
+        run: find . -name "*.sh" -not -path "./.git/*" -print0 | xargs -0 chmod +x
+
+      - name: Run test suite
+        run: bash tests/run-tests.sh
+
+  build-deb:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq dpkg-dev
+
+      - name: Extract version from tag
+        id: version
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Build .deb
+        run: |
+          chmod +x packaging/build-deb.sh
+          bash packaging/build-deb.sh --version "${{ steps.version.outputs.version }}"
+
+      - name: Upload .deb artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dsms-gui-deb
+          path: dist/*.deb
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.deb
+          generate_release_notes: true
